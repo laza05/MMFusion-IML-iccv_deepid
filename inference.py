@@ -1,92 +1,134 @@
-import argparse
+import os
+import cv2
 import numpy as np
-from torch.utils.data import DataLoader
 import torch
 import torchvision.transforms.functional as TF
-import logging
-import matplotlib.pyplot as plt
-from data.datasets import ManipulationDataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
 from models.cmnext_conf import CMNeXtWithConf
 from models.modal_extract import ModalitiesExtractor
 from configs.cmnext_init_cfg import _C as config, update_config
 
-parser = argparse.ArgumentParser(description='Infer')
-parser.add_argument('-gpu', '--gpu', type=int, default=0, help='device, use -1 for cpu')
-parser.add_argument('-log', '--log', type=str, default='INFO', help='logging level')
-parser.add_argument('-exp', '--exp', type=str, default='experiments/ec_example_phase2.yaml', help='Yaml experiment file')
-parser.add_argument('-ckpt', '--ckpt', type=str, default='ckpt/early_fusion_detection.pth', help='Checkpoint')
-parser.add_argument('-path', '--path', type=str, default='example.png', help='Image path')
-parser.add_argument('opts', help="other options", default=None, nargs=argparse.REMAINDER)
 
-args = parser.parse_args()
+class MMFusionDetector:
+    def __init__(self, config_path, checkpoint_path, device=None):
+        """
+        Initialize the MMFusion detector.
 
-config = update_config(config, args.exp)
+        Args:
+            config_path: Path to the yaml configuration file
+            checkpoint_path: Path to the model checkpoint
+            device: Device to run inference on ('cuda:0', 'cpu', etc.)
+        """
+        self.cfg = update_config(config, config_path)
 
-loglvl = getattr(logging, args.log.upper())
-logging.basicConfig(level=loglvl)
+        if device is None:
+            self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
 
-gpu = args.gpu
+        # Initialize models
+        self.modal_extractor = ModalitiesExtractor(self.cfg.MODEL.MODALS[1:], self.cfg.MODEL.NP_WEIGHTS)
+        self.model = CMNeXtWithConf(self.cfg.MODEL)
 
-device = 'cuda:%d' % gpu if gpu >= 0 else 'cpu'
-np.set_printoptions(formatter={'float': '{: 7.3f}'.format})
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt['state_dict'])
+        self.modal_extractor.load_state_dict(ckpt['extractor_state_dict'])
 
-if device != 'cpu':
-    # cudnn setting
-    import torch.backends.cudnn as cudnn
+        # Set models to evaluation mode and move to device
+        self.modal_extractor.to(self.device)
+        self.model.to(self.device)
+        self.modal_extractor.eval()
+        self.model.eval()
 
-    cudnn.benchmark = False
-    cudnn.deterministic = True
-    cudnn.enabled = config.CUDNN.ENABLED
+        # Setup image transforms
+        self.image_transforms_final = A.Compose([
+            ToTensorV2()
+        ])
+
+    def infer(self, image_path):
+        """
+        Perform inference on a single image.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            detection_score: Probability of manipulation (0-1)
+        """
+        # Load and preprocess image
+        image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+
+        # Check if image is too large and resize if needed
+        h, w = image.shape[:2]
+        if h > 2048 or w > 2048:
+            image = A.LongestMaxSize(max_size=2048)(image=image)['image']
+
+        # Convert to tensor and normalize
+        image_tensor = self.image_transforms_final(image=image)['image']
+        image_tensor = image_tensor / 256.0
+        image_tensor = image_tensor.unsqueeze(0).to(self.device)
+
+        # Run inference
+        with torch.no_grad():
+            # Extract modalities
+            modals = self.modal_extractor(image_tensor)
+
+            # Normalize image for the model
+            image_norm = TF.normalize(image_tensor,
+                                      mean=[0.485, 0.456, 0.406],
+                                      std=[0.229, 0.224, 0.225])
+
+            # Prepare input and run model
+            inp = [image_norm] + modals
+            anomaly, confidence, detection = self.model(inp)
+
+            # Get final detection score
+            detection_score = torch.sigmoid(detection).squeeze().cpu().item()
+
+        return detection_score
+
+    def infer_batch(self, image_paths):
+        """
+        Perform inference on multiple images.
+
+        Args:
+            image_paths: List of paths to image files
+
+        Returns:
+            detection_scores: List of manipulation probabilities (0-1)
+        """
+        detection_scores = []
+
+        for path in image_paths:
+            score = self.infer(path)
+            detection_scores.append(score)
+
+        return detection_scores
 
 
-modal_extractor = ModalitiesExtractor(config.MODEL.MODALS[1:], config.MODEL.NP_WEIGHTS)
+# Example usage:
+if __name__ == "__main__":
+    import argparse
 
-model = CMNeXtWithConf(config.MODEL)
+    parser = argparse.ArgumentParser(description='MMFusion Inference')
+    parser.add_argument('-cfg', '--config', type=str, required=True, help='Path to the config file')
+    parser.add_argument('-ckpt', '--checkpoint', type=str, required=True, help='Path to the checkpoint')
+    parser.add_argument('-img', '--image', type=str, required=True, help='Path to the image')
+    parser.add_argument('-gpu', '--gpu', type=int, default=0, help='GPU ID (use -1 for CPU)')
 
-ckpt = torch.load(args.ckpt)
+    args = parser.parse_args()
 
-model.load_state_dict(ckpt['state_dict'])
-modal_extractor.load_state_dict(ckpt['extractor_state_dict'])
+    device = f'cuda:{args.gpu}' if args.gpu >= 0 and torch.cuda.is_available() else 'cpu'
 
-modal_extractor.to(device)
-model = model.to(device)
-modal_extractor.eval()
-model.eval()
+    # Initialize detector
+    detector = MMFusionDetector(args.config, args.checkpoint, device)
 
-target = args.path.split(".")[-2] + "_mask.png"
+    # Run inference
+    score = detector.infer(args.image)
 
-with open('tmp_inf.txt', 'w') as f:
-    f.write(args.path + ' None 0\n')
-
-val = ManipulationDataset('tmp_inf.txt',
-                          config.DATASET.IMG_SIZE,
-                          train=False)
-val_loader = DataLoader(val,
-                        batch_size=1,
-                        shuffle=False,
-                        num_workers=config.WORKERS,
-                        pin_memory=True)
-
-f1 = []
-f1th = []
-for step, (images, _, masks, lab) in enumerate(val_loader):
-    with torch.no_grad():
-        images = images.to(device, non_blocking=True)
-        masks = masks.squeeze(1).to(device, non_blocking=True)
-
-        modals = modal_extractor(images)
-
-        images_norm = TF.normalize(images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        inp = [images_norm] + modals
-
-        anomaly, confidence, detection = model(inp)
-
-        gt = masks.squeeze().cpu().numpy()
-        map = torch.nn.functional.softmax(anomaly, dim=1)[:, 1, :, :].squeeze().cpu().numpy()
-        det = detection.item()
-
-        plt.imsave(target, map, cmap='RdBu_r', vmin=0, vmax=1)
-
-print(f"Ran on {args.path}")
-print(f"Detection score: {det}")
-print(f"Localization map saved in {target}")
+    print(f"Image: {args.image}")
+    print(f"Manipulation detection score: {score:.4f}")
+    print(f"{'MANIPULATED' if score > 0.5 else 'AUTHENTIC'} (threshold=0.5)")
